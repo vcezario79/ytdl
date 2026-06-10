@@ -128,21 +128,31 @@ class DownloaderPage extends StatefulWidget {
 
 class _DownloaderPageState extends State<DownloaderPage> {
   final _urlController = TextEditingController();
-  String _downloadPath = '';
+  String _audioPath = '';
+  String _videoPath = '';
+  // Always points to the active path for the current mode.
+  String get _downloadPath => _downloadVideo ? _videoPath : _audioPath;
+  set _downloadPath(String v) {
+    if (_downloadVideo) _videoPath = v; else _audioPath = v;
+  }
   final List<DownloadJob> _jobs = [];
   bool _isDownloading = false;
   File? _logFile;
   String _prefsPath = '';
   bool _playlistSubfolder = true;
+  bool _downloadVideo = false;
   String _librarySize = '';
+  String _libraryPath = '';
+  String? _ytDlpExe;     // null = not ready; set to full path once confirmed
+  bool _ytDlpChecking = true; // true while _resolveYtDlp is running
 
   @override
   void initState() {
     super.initState();
-    final home = Platform.environment['HOME'] ??
-        p.join('/home', Platform.environment['USER'] ?? '');
-    _downloadPath = home;
-    _prefsPath = '$home/.config/ytdlp_ui/prefs.json';
+    _audioPath = _defaultDownloadPath();
+    _videoPath = _defaultDownloadPath();
+    _libraryPath = _audioPath;
+    _prefsPath = _prefsFilePath();
 
     _logFile = File('ytdlp.log');
     _logFile!.writeAsStringSync(
@@ -152,10 +162,150 @@ class _DownloaderPageState extends State<DownloaderPage> {
 
     _loadPrefs();
     _computeLibrarySize();
+    _checkYtDlp();
+  }
+
+  /// Extracts the bundled yt-dlp binary from Flutter assets to the app cache
+  /// directory (if not already there) and returns its full path.
+  /// On Windows the asset is yt-dlp.exe; on Linux/macOS it is yt-dlp.
+  /// Returns null if extraction or execution fails.
+  static Future<String?> _resolveYtDlp() async {
+    final assetName = Platform.isWindows ? 'yt-dlp.exe' : 'yt-dlp';
+    final assetPath = 'assets/bin/$assetName';
+
+    // Use the system temp dir so it survives across debug restarts and is
+    // writable in both debug and release without extra permissions.
+    final cacheDir = Directory(p.join(
+      Platform.environment['LOCALAPPDATA'] ??        // Windows
+      Platform.environment['XDG_CACHE_HOME'] ??      // Linux (XDG)
+      p.join(Platform.environment['HOME'] ?? '', '.cache'), // Linux fallback / macOS
+      'ytdlp_ui',
+    ));
+    await cacheDir.create(recursive: true);
+
+    final dest = File(p.join(cacheDir.path, assetName));
+
+    // Extract from asset bundle if the file doesn't exist yet.
+    if (!dest.existsSync()) {
+      try {
+        final data = await rootBundle.load(assetPath);
+        await dest.writeAsBytes(data.buffer.asUint8List(), flush: true);
+        // Make executable on non-Windows.
+        if (!Platform.isWindows) {
+          await Process.run('chmod', ['+x', dest.path]);
+        }
+      } catch (e) {
+        return null; // Asset missing from bundle.
+      }
+    }
+
+    // Verify it actually runs.
+    try {
+      final result = await Process.run(dest.path, ['--version']);
+      if (result.exitCode == 0) return dest.path;
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _checkYtDlp() async {
+    if (mounted) setState(() => _ytDlpChecking = true);
+    final path = await _resolveYtDlp();
+    if (mounted) setState(() { _ytDlpExe = path; _ytDlpChecking = false; });
+    if (_ytDlpExe == null && mounted) _showYtDlpMissingDialog();
+  }
+
+  void _showYtDlpMissingDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF242424),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: Color(0xFF444444)),
+        ),
+        title: const Row(children: [
+          Icon(Icons.warning_amber_rounded, color: Color(0xFFFFB74D), size: 22),
+          SizedBox(width: 10),
+          Text('yt-dlp unavailable', style: TextStyle(fontSize: 16)),
+        ]),
+        content: const Text(
+          'The bundled yt-dlp binary could not be initialised.\n\n'
+          'This usually means the app was not built with the asset included. '
+          'Make sure assets/bin/yt-dlp'
+          'exists in the project and is declared in pubspec.yaml.',
+          style: TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Dismiss'),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _checkYtDlp();
+            },
+            icon: const Icon(Icons.refresh_rounded, size: 16),
+            label: const Text('Re-check'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Returns a sensible default download directory for the current platform.
+  static String _defaultDownloadPath() {
+    if (Platform.isWindows) {
+      final userProfile = Platform.environment['USERPROFILE'];
+      if (userProfile != null && userProfile.isNotEmpty) {
+        final downloads = p.join(userProfile, 'Downloads');
+        if (Directory(downloads).existsSync()) return downloads;
+        return userProfile;
+      }
+      return r'C:\Users\Public\Downloads';
+    }
+    if (Platform.isAndroid) {
+      // SAF paths are opaque; start with external storage root.
+      return Platform.environment['EXTERNAL_STORAGE'] ?? '/sdcard';
+    }
+    // Linux / macOS
+    final home = Platform.environment['HOME'] ??
+        p.join('/home', Platform.environment['USER'] ?? 'user');
+    final xdgDownloads = Platform.environment['XDG_DOWNLOAD_DIR'];
+    if (xdgDownloads != null && xdgDownloads.isNotEmpty) return xdgDownloads;
+    final downloads = p.join(home, 'Downloads');
+    if (Directory(downloads).existsSync()) return downloads;
+    return home;
+  }
+
+  /// Returns the path to the prefs JSON file for the current platform.
+  static String _prefsFilePath() {
+    if (Platform.isWindows) {
+      final appData = Platform.environment['APPDATA'];
+      if (appData != null && appData.isNotEmpty) {
+        return p.join(appData, 'ytdlp_ui', 'prefs.json');
+      }
+      final userProfile = Platform.environment['USERPROFILE'] ?? r'C:\Users\Public';
+      return p.join(userProfile, 'AppData', 'Roaming', 'ytdlp_ui', 'prefs.json');
+    }
+    if (Platform.isAndroid) {
+      // Use the app's external files dir via env, fall back to internal.
+      final extStorage = Platform.environment['EXTERNAL_STORAGE'] ?? '/sdcard';
+      return p.join(extStorage, 'Android', 'data', 'ytdlp_ui', 'prefs.json');
+    }
+    // Linux / macOS: follow XDG on Linux, ~/Library on macOS
+    if (Platform.isMacOS) {
+      final home = Platform.environment['HOME'] ?? '';
+      return p.join(home, 'Library', 'Application Support', 'ytdlp_ui', 'prefs.json');
+    }
+    final configHome = Platform.environment['XDG_CONFIG_HOME'] ??
+        p.join(Platform.environment['HOME'] ?? '', '.config');
+    return p.join(configHome, 'ytdlp_ui', 'prefs.json');
   }
 
   Future<void> _computeLibrarySize() async {
-    final dir = Directory('/home/deck/Music');
+    final dir = Directory(_libraryPath);
     if (!dir.existsSync()) return;
     int total = 0;
     await for (final f in dir.list(recursive: true, followLinks: false)) {
@@ -180,12 +330,24 @@ class _DownloaderPageState extends State<DownloaderPage> {
       final f = File(_prefsPath);
       if (f.existsSync()) {
         final data = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
-        if (data['lastFolder'] != null) {
-          setState(() => _downloadPath = data['lastFolder'] as String);
+        if (data['audioFolder'] != null) {
+          setState(() => _audioPath = data['audioFolder'] as String);
+        } else if (data['lastFolder'] != null) {
+          // Migrate old single-path prefs.
+          setState(() => _audioPath = data['lastFolder'] as String);
+        }
+        if (data['videoFolder'] != null) {
+          setState(() => _videoPath = data['videoFolder'] as String);
         }
         if (data['playlistSubfolder'] != null) {
           setState(
               () => _playlistSubfolder = data['playlistSubfolder'] as bool);
+        }
+        if (data['downloadVideo'] != null) {
+          setState(() => _downloadVideo = data['downloadVideo'] as bool);
+        }
+        if (data['libraryPath'] != null) {
+          setState(() => _libraryPath = data['libraryPath'] as String);
         }
       }
     } catch (_) {}
@@ -196,8 +358,11 @@ class _DownloaderPageState extends State<DownloaderPage> {
       final f = File(_prefsPath);
       f.parent.createSync(recursive: true);
       f.writeAsStringSync(jsonEncode({
-        'lastFolder': _downloadPath,
+        'audioFolder': _audioPath,
+        'videoFolder': _videoPath,
         'playlistSubfolder': _playlistSubfolder,
+        'downloadVideo': _downloadVideo,
+        'libraryPath': _libraryPath,
       }));
     } catch (_) {}
   }
@@ -214,13 +379,49 @@ class _DownloaderPageState extends State<DownloaderPage> {
   // ── Actions ─────────────────────────────────────────────────────────────────
 
   Future<void> _pickFolder() async {
+    // Only pass initialDirectory if the path actually exists on this platform.
+    // On Windows, getDirectoryPath also requires backslash separators or it
+    // throws Error 0x80070057 ("invalid parameter").
+    String? initialDir;
+    if (Directory(_downloadPath).existsSync()) {
+      initialDir = Platform.isWindows
+          ? _downloadPath.replaceAll('/', '\\')
+          : _downloadPath;
+    }
+
     final result = await FilePicker.platform.getDirectoryPath(
       dialogTitle: 'Choose Download Location',
-      initialDirectory: _downloadPath,
+      initialDirectory: initialDir,
     );
     if (result != null && mounted) {
-      setState(() => _downloadPath = result);
+      setState(() {
+        _downloadPath = result;
+        // Recompute library size for the new folder.
+        _librarySize = '';
+      });
       _savePrefs();
+      _computeLibrarySize();
+    }
+  }
+
+  Future<void> _pickLibraryFolder() async {
+    String? initialDir;
+    if (Directory(_libraryPath).existsSync()) {
+      initialDir = Platform.isWindows
+          ? _libraryPath.replaceAll('/', '\\')
+          : _libraryPath;
+    }
+    final result = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Choose Library Folder',
+      initialDirectory: initialDir,
+    );
+    if (result != null && mounted) {
+      setState(() {
+        _libraryPath = result;
+        _librarySize = '';
+      });
+      _savePrefs();
+      _computeLibrarySize();
     }
   }
 
@@ -261,25 +462,44 @@ class _DownloaderPageState extends State<DownloaderPage> {
     _writeLog(job.url, 'Command: yt-dlp ... ${job.url}');
 
     try {
-      final process = await Process.start('yt-dlp', [
-        '--extract-audio',
-        '--audio-format', 'mp3',
-        '--audio-quality', '0', // best VBR
-        '--embed-thumbnail',
-        '--add-metadata',
-        '--newline',
-        '--no-color',
-        '-o', outputTemplate,
-        job.url,
-      ]);
+      final exe = _ytDlpExe;
+      if (exe == null) {
+        job.setError('yt-dlp binary not available.');
+        job.setStatus(JobStatus.error);
+        return;
+      }
+      final process = await Process.start(
+        exe,
+        [
+          if (_downloadVideo) ...[
+            // Video mode: best <=1080p MP4 stream merged with best audio.
+            '-f', 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]'
+                  '/bestvideo[height<=1080]+bestaudio'
+                  '/best[height<=1080]',
+            '--merge-output-format', 'mp4',
+          ] else ...[
+            // Audio mode: extract best-quality MP3.
+            '--extract-audio',
+            '--audio-format', 'mp3',
+            '--audio-quality', '0',
+            '--embed-thumbnail',
+          ],
+          '--add-metadata',
+          '--newline',
+          '--no-color',
+          '-o', outputTemplate,
+          job.url,
+        ],
+      );
 
       job._process = process;
 
-      // stdout — progress + info lines
-      process.stdout
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) {
+      // Drain stdout and stderr concurrently before awaiting exitCode.
+      // If either pipe is left un-drained the OS buffer fills, the subprocess
+      // blocks on write, and process.exitCode never resolves (deadlock).
+      // This is especially pronounced during the ffmpeg merge step in video
+      // mode, which writes heavily to stderr.
+      void handleStdout(String line) {
         job.addLog(line);
         _writeLog(job.url, line);
 
@@ -306,20 +526,32 @@ class _DownloaderPageState extends State<DownloaderPage> {
             line.contains('has already been downloaded')) {
           job.setProgress(1.0);
         }
-      });
+      }
 
-      // stderr — warnings / errors
-      process.stderr
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) {
+      void handleStderr(String line) {
         if (line.trim().isNotEmpty) {
           job.addLog('⚠ $line');
           _writeLog(job.url, 'STDERR: $line');
         }
-      });
+      }
 
-      final code = await process.exitCode;
+      final stdoutDone = process.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach(handleStdout);
+
+      final stderrDone = process.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach(handleStderr);
+
+      // Wait for both pipes to close, then get the exit code.
+      final results = await Future.wait([
+        stdoutDone,
+        stderrDone,
+        process.exitCode,
+      ]);
+      final code = results[2] as int;
       _writeLog(job.url, 'Process exited with code $code');
       if (job.status == JobStatus.cancelled) {
         // already marked, do nothing
@@ -383,6 +615,27 @@ class _DownloaderPageState extends State<DownloaderPage> {
                   color: cs.onSurface.withOpacity(0.5), fontSize: 13)),
         ]),
         actions: [
+          // yt-dlp status indicator: spinner while checking, warning when failed
+          if (_ytDlpChecking)
+            Tooltip(
+              message: 'Initialising yt-dlp…',
+              child: SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: cs.onSurface.withOpacity(0.3),
+                ),
+              ),
+            )
+          else if (_ytDlpExe == null)
+            Tooltip(
+              message: 'yt-dlp unavailable — tap for details',
+              child: IconButton(
+                onPressed: _showYtDlpMissingDialog,
+                icon: const Icon(Icons.warning_amber_rounded,
+                    color: Color(0xFFFFB74D), size: 20),
+              ),
+            ),
           if (_jobs.any((j) =>
               j.status == JobStatus.done ||
               j.status == JobStatus.error ||
@@ -455,13 +708,57 @@ class _DownloaderPageState extends State<DownloaderPage> {
 
                     // Format badge + download button
                     Row(children: [
-                      _Badge(icon: Icons.music_note_rounded, label: 'MP3'),
+                      // MP3 / MP4 toggle
+                      GestureDetector(
+                        onTap: () {
+                          setState(() => _downloadVideo = !_downloadVideo);
+                          _savePrefs();
+                        },
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: _downloadVideo
+                                ? const Color(0xFF1565C0).withOpacity(0.2)
+                                : cs.primary.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(
+                              color: _downloadVideo
+                                  ? const Color(0xFF1565C0).withOpacity(0.6)
+                                  : cs.primary.withOpacity(0.5),
+                            ),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(
+                              _downloadVideo
+                                  ? Icons.videocam_rounded
+                                  : Icons.music_note_rounded,
+                              size: 12,
+                              color: _downloadVideo
+                                  ? const Color(0xFF64B5F6)
+                                  : cs.primary,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              _downloadVideo ? 'MP4 · 1080p' : 'MP3',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: _downloadVideo
+                                    ? const Color(0xFF64B5F6)
+                                    : cs.primary,
+                              ),
+                            ),
+                          ]),
+                        ),
+                      ),
                       const SizedBox(width: 8),
                       _Badge(icon: Icons.star_rounded, label: 'Best quality'),
                       const SizedBox(width: 8),
-                      _Badge(
-                          icon: Icons.image_rounded, label: 'Embed thumbnail'),
-                      const SizedBox(width: 8),
+                      if (!_downloadVideo) ...[
+                        _Badge(icon: Icons.image_rounded, label: 'Embed thumbnail'),
+                        const SizedBox(width: 8),
+                      ],
                       GestureDetector(
                         onTap: () {
                           setState(
@@ -558,6 +855,16 @@ class _DownloaderPageState extends State<DownloaderPage> {
                   'Library: $_librarySize',
                   style: TextStyle(
                       fontSize: 11, color: cs.onSurface.withOpacity(0.3)),
+                ),
+                const SizedBox(width: 4),
+                InkWell(
+                  onTap: _pickLibraryFolder,
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.all(3),
+                    child: Icon(Icons.edit_rounded,
+                        size: 11, color: cs.onSurface.withOpacity(0.2)),
+                  ),
                 ),
               ]),
             ],
